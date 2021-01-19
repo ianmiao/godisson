@@ -1,4 +1,4 @@
-module github.com/cakiecakie/godisson
+module github.com/ianmiao/godisson
 
 go 1.15
 
