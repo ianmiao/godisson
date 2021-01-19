@@ -27,6 +27,8 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+        ports:
+          - 6379:6379
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
@@ -35,4 +37,4 @@ jobs:
 
       # Runs a single command using the runners shell
       - name: test
-        run: REDIS_ADDR="redis://redis:6379/0" go test ./...
+        run: REDIS_ADDR="redis://localhost:6379" go test ./...
