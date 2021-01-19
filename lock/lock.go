@@ -1,6 +1,8 @@
 package lock
 
 import (
+	"log"
+	"sync"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
@@ -8,18 +10,24 @@ import (
 )
 
 type (
+	// do not copy after first use
 	LockManager struct {
-		AsyncErrCh chan error
-
-		namespace      string // Redis namespace
-		memberID       uint64 // identify process
-		pool           *redis.Pool
-		leaseCycleMsec int64
-		stopRenewalCh  chan struct{} // use to stop renewal goroutine
-		needRenewal    bool
+		asyncErrCh       chan error
+		asyncErrListener AsyncErrListener
+		namespace        string // Redis namespace
+		memberID         uint64 // identify process
+		pool             *redis.Pool
+		leaseCycleMsec   int64
+		renewalNotifyCh  chan RenewalNotify // use to stop renewal goroutine
+		needRenewal      bool
+		inflight         sync.WaitGroup
 	}
 
-	RetCode int64
+	AsyncErrListener func(*LockManager, error)
+
+	LockManagerOption func(*LockManager)
+
+	RenewalNotify uint8
 )
 
 const (
@@ -31,7 +39,26 @@ const (
 )
 
 const (
+	RENEWAL_NOTIFY_START RenewalNotify = 1 + iota
+	RENEWAL_NOTIFY_STOP
+)
+
+const (
 	UNLOCK_NOTIFY = uint8(1)
+)
+
+var (
+	RenewalOption = func() LockManagerOption {
+		return func(manager *LockManager) {
+			manager.needRenewal = true
+		}
+	}
+
+	AsyncErrListenerOption = func(listener AsyncErrListener) LockManagerOption {
+		return func(manager *LockManager) {
+			manager.asyncErrListener = listener
+		}
+	}
 )
 
 var (
@@ -39,6 +66,13 @@ var (
 	ErrUnlockAnotherMember  = errors.New("unlock another member error")
 	ErrAsyncRenewal         = errors.New("renewal key async error")
 	ErrAsyncLock            = errors.New("lock key async error")
+)
+
+var (
+	defaultAsyncErrListener = func(manager *LockManager, err error) {
+		log.Printf("[godisson] async err: %s", err.Error())
+		manager.Close()
+	}
 )
 
 var (
@@ -55,8 +89,9 @@ if (redis.call("EXISTS", lockKey) == 1) then
 end
 
 -- reentrant lock
+local res =  redis.call("HINCRBY", lockKey, memberID, 1) 
 redis.call("PEXPIRE", lockKey, leaseMsec)
-if redis.call("HINCRBY", lockKey, memberID, 1) == 1 then
+if (res == 1) then
 	return -1
 end
 
@@ -84,6 +119,7 @@ if (redis.call("HINCRBY", lockKey, memberID, -1) ~= 0) then
 end
 
 -- unlock success
+redis.call("DEL", lockKey)
 redis.call("PUBLISH", pubsubKey, pubMsg)
 return -1
 	`)
@@ -101,30 +137,37 @@ return -1
 	`)
 )
 
-// Example:
-// lm := NewLockManager(...)
-// go func() {
-// 	for err := range lm.AsyncErrCh {
-// 		log.Println(err)
-// 	}
-// }
-// err := lm.Lock()
-// if err != nil {
-// 	...
-// }
-//
-// lm.Unlock()
-func NewLockManager(pool *redis.Pool, namespace string, memberID uint64, leaseCycleMsec int64, needRenewal bool) *LockManager {
-	return &LockManager{
-		AsyncErrCh: make(chan error, 1),
+func NewLockManager(pool *redis.Pool, namespace string, memberID uint64, leaseCycleMsec int64,
+	opts ...LockManagerOption) *LockManager {
 
-		namespace:      namespace,
-		memberID:       memberID,
-		pool:           pool,
-		leaseCycleMsec: leaseCycleMsec,
-		stopRenewalCh:  make(chan struct{}),
-		needRenewal:    needRenewal,
+	lm := LockManager{
+		asyncErrCh:       make(chan error, 1),
+		asyncErrListener: defaultAsyncErrListener,
+		namespace:        namespace,
+		memberID:         memberID,
+		pool:             pool,
+		leaseCycleMsec:   leaseCycleMsec,
+		renewalNotifyCh:  make(chan RenewalNotify),
+		needRenewal:      false,
+		inflight:         sync.WaitGroup{},
 	}
+
+	for _, opt := range opts {
+		opt(&lm)
+	}
+
+	go lm.processAsyncErr()
+
+	if lm.needRenewal {
+		lm.inflight.Add(1)
+		go lm.renewal()
+	}
+
+	return &lm
+}
+
+func (manager *LockManager) Close() {
+	close(manager.asyncErrCh)
 }
 
 func (manager *LockManager) TryLock() (bool, int64, error) {
@@ -140,9 +183,9 @@ func (manager *LockManager) TryLock() (bool, int64, error) {
 
 	switch res {
 	case RES_CODE_SUCCESS:
-		// acquire lock for the first time
+		// acquire the lock for the first time
 		if manager.needRenewal {
-			go manager.renewal()
+			manager.renewalNotifyCh <- RENEWAL_NOTIFY_START
 		}
 		return true, 0, nil
 	case RES_CODE_SUCCESS_REENTRANT:
@@ -175,7 +218,7 @@ func (manager *LockManager) Unlock() error {
 
 	// stop renewal
 	if manager.needRenewal {
-		manager.stopRenewalCh <- struct{}{}
+		manager.renewalNotifyCh <- RENEWAL_NOTIFY_STOP
 	}
 
 	return nil
@@ -187,7 +230,6 @@ func (manager *LockManager) LockWithTimeout(timeoutMsec int64) (bool, error) {
 	defer timeoutTimer.Stop()
 
 	cancelCh := make(chan struct{})
-	defer close(cancelCh)
 
 	resCh := make(chan struct {
 		success bool
@@ -206,8 +248,9 @@ func (manager *LockManager) LockWithTimeout(timeoutMsec int64) (bool, error) {
 
 	select {
 	case <-timeoutTimer.C:
-		// cancel lock goroutine with defer
-		return false, nil
+		close(cancelCh)
+		res := <-resCh
+		return res.success, res.err
 	case res := <-resCh:
 		return res.success, res.err
 	}
@@ -247,7 +290,7 @@ func (manager *LockManager) lock(cancelCh chan struct{}) (bool, int64, error) {
 		for {
 			switch n := psConn.Receive().(type) {
 			case error:
-				manager.AsyncErrCh <- errors.WithMessage(ErrAsyncLock, n.Error())
+				manager.asyncErrCh <- errors.WithMessage(ErrAsyncLock, n.Error())
 				return
 			case redis.Message:
 				msgCh <- n
@@ -298,29 +341,67 @@ func (manager *LockManager) lock(cancelCh chan struct{}) (bool, int64, error) {
 
 func (manager *LockManager) renewal() {
 
-	ticker := time.NewTicker(time.Duration(manager.leaseCycleMsec) * time.Millisecond / 2)
-	defer ticker.Stop()
+	defer manager.inflight.Done()
+
+	var ticker *time.Ticker
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+
+	dummyTickerCh := make(chan time.Time)
+
+	getTickerCh := func() <-chan time.Time {
+		if ticker == nil {
+			return dummyTickerCh
+		}
+		return ticker.C
+	}
 
 	for {
 		select {
-		case <-ticker.C:
+		case notify, has := <-manager.renewalNotifyCh:
+
+			// renewalNotifyCh closed
+			if !has {
+				return
+			}
+
+			switch notify {
+			case RENEWAL_NOTIFY_START:
+				ticker = time.NewTicker(time.Duration(manager.leaseCycleMsec) * time.Millisecond / 2)
+			case RENEWAL_NOTIFY_STOP:
+				if ticker != nil {
+					ticker.Stop()
+				}
+				ticker = nil
+			}
+		case <-getTickerCh():
+
 			conn := manager.pool.Get()
 			defer conn.Close()
 
 			res, err := redis.Int64(renewalScript.Do(conn, manager.getLockKey(),
 				manager.memberID, manager.leaseCycleMsec))
 			if err != nil {
-				manager.AsyncErrCh <- errors.WithMessage(ErrAsyncRenewal, err.Error())
+				manager.asyncErrCh <- errors.WithMessage(ErrAsyncRenewal, err.Error())
 				return
 			}
 
 			switch res {
 			case RES_CODE_RENEWAL_NON_EXISTENT_LOCK:
-				return
+				// stop renewal
+				ticker.Stop()
+				ticker = nil
 			}
-		case <-manager.stopRenewalCh:
-			return
 		}
+	}
+}
+
+func (manager *LockManager) processAsyncErr() {
+	for err := range manager.asyncErrCh {
+		manager.asyncErrListener(manager, err)
 	}
 }
 
