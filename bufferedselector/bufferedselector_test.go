@@ -92,7 +92,8 @@ func Test_BufferedSelectorManager(t *testing.T) {
 			TimeoutMsecOption(timeoutMsec))
 		require.NoError(t, err)
 
-		gotSelectNew, err := manager.SelectNew(selectorID, now.UnixNano()/int64(time.Millisecond)+timeoutMsec)
+		gotSelectNew, err := manager.SelectNew(selectorID,
+			now.Add(time.Duration(timeoutMsec)*time.Millisecond*2).UnixNano()/int64(time.Millisecond))
 		require.NoError(t, err)
 
 		assert.True(t, gotSelectNew)
