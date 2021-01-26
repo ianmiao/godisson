@@ -1,4 +1,4 @@
-# Distributed lock with single redis instance
+# Distributed lock with watch dog
 
 ```go
 pool := redis.NewPool(func() (redis.Conn, error) {
@@ -10,6 +10,7 @@ lm := godisson.NewLockManager(pool, "redis_namespace", uuid/*member ID*/,
 	int64(time.Second/time.Millisecond), AsyncErrListenerOption(func(err error) {
 		assert.NoError(t, err)
 	}),
+	RenewalOption(),
 )
 defer lm.Close()
 
