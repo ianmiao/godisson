@@ -22,6 +22,7 @@ type (
 		needRenewal      bool
 		renewalTicker    *time.Ticker
 		inflight         sync.WaitGroup
+		closeOnce        sync.Once
 	}
 
 	AsyncErrListener func(error)
@@ -88,13 +89,15 @@ if (redis.call("EXISTS", lockKey) == 1) then
 	end
 end
 
--- reentrant lock
 local res =  redis.call("HINCRBY", lockKey, memberID, 1) 
 redis.call("PEXPIRE", lockKey, leaseMsec)
+
+-- successful lock
 if (res == 1) then
 	return -1
 end
 
+-- reentrant lock
 return -5
 	`)
 	unlockScript = redis.NewScript(2, `
@@ -118,7 +121,7 @@ if (redis.call("HINCRBY", lockKey, memberID, -1) ~= 0) then
 	return -5
 end
 
--- unlock success
+-- successful unlock
 redis.call("DEL", lockKey)
 redis.call("PUBLISH", pubsubKey, pubMsg)
 return -1
@@ -128,10 +131,12 @@ local lockKey = KEYS[1]
 local memberID = ARGV[1]
 local leaseMsec = ARGV[2]
 
+-- renew no existent lock
 if (redis.call("HEXISTS", lockKey, memberID) == 0) then
 	return -4
 end
 
+-- successful renew
 redis.call("PEXPIRE", lockKey, leaseMsec)
 return -1
 	`)
@@ -170,9 +175,11 @@ func NewLockManager(pool *redis.Pool, namespace string, memberID uint64, leaseCy
 // stop background goroutine
 // do not close LockManager during use
 func (manager *LockManager) Close() {
-	close(manager.renewalNotifyCh)
-	manager.inflight.Wait()
-	close(manager.asyncErrCh)
+	manager.closeOnce.Do(func() {
+		close(manager.renewalNotifyCh)
+		manager.inflight.Wait()
+		close(manager.asyncErrCh)
+	})
 }
 
 func (manager *LockManager) TryLock() (bool, int64, error) {
